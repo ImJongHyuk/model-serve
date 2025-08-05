@@ -1,5 +1,5 @@
 [project]
-name = "ax-serve"
+name = "model-serve"
 version = "0.1.0"
 description = "FastAPI server for Hugging Face A.X-4.0-VL-Light model with OpenAI-compatible API"
 readme = "README.md"
