@@ -52,7 +52,7 @@ class ChatService:
             request_validator: RequestValidator instance (optional)
         """
         self.model_manager = model_manager
-        self.message_processor = message_processor or MessageProcessor()
+        self.message_processor = message_processor or MessageProcessor(model_manager)
         self.image_handler = image_handler or ImageHandler()
         
         # Initialize request validator

@@ -14,9 +14,12 @@ from transformers import (
 
 try:
     from transformers import BitsAndBytesConfig
+    import bitsandbytes
+    import accelerate
     HAS_BITSANDBYTES = True
 except ImportError:
     HAS_BITSANDBYTES = False
+    BitsAndBytesConfig = None
 from app.config import settings
 from app.schemas.error_models import ModelNotLoadedError, ModelError
 
@@ -62,13 +65,18 @@ class ModelManager:
         # Add quantization if GPU memory is limited and bitsandbytes is available
         if (self.device.startswith("cuda") and 
             settings.gpu_memory_fraction < 1.0 and 
-            HAS_BITSANDBYTES):
-            self.model_config["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4"
-            )
+            HAS_BITSANDBYTES and 
+            BitsAndBytesConfig is not None):
+            try:
+                self.model_config["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4"
+                )
+                logger.info("4-bit quantization enabled for GPU memory optimization")
+            except Exception as e:
+                logger.warning(f"Failed to enable quantization: {e}. Proceeding without quantization.")
         
         self._lock = asyncio.Lock()
         
@@ -168,6 +176,15 @@ class ModelManager:
                     logger.info(f"Device: {first_param.device}")
                 except StopIteration:
                     logger.info("Device: No parameters found")
+                
+                # Log chat template info
+                if hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template:
+                    logger.info("Chat template available - using tokenizer's chat template")
+                else:
+                    logger.warning("No chat template found - using fallback format")
+                
+                # Log special tokens
+                logger.info(f"Special tokens - EOS: {self.tokenizer.eos_token}, PAD: {self.tokenizer.pad_token}")
                 
                 # Log GPU memory usage if using CUDA
                 if self.device.startswith("cuda"):
@@ -359,6 +376,130 @@ class ModelManager:
             })
         
         return info
+    
+    def has_chat_template(self) -> bool:
+        """Check if the tokenizer has a chat template."""
+        if not self.tokenizer:
+            return False
+        return hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None
+    
+    def prepare_inputs(
+        self, 
+        messages: List[Dict[str, Any]], 
+        images: List[Any] = None
+    ) -> Dict[str, Any]:
+        """Prepare model inputs using processor's conversations format (official method).
+        
+        Args:
+            messages: List of message dictionaries in OpenAI format
+            images: List of images (PIL Images, URLs, or base64 strings)
+            
+        Returns:
+            Processor inputs ready for model generation
+        """
+        if not self.processor and not self.tokenizer:
+            raise ModelNotLoadedError("Processor/Tokenizer not loaded")
+        
+        # Convert to official A.X-4.0-VL-Light format
+        conversations = [self._convert_to_ax_format(messages)]
+        
+        try:
+            # Use processor if available (preferred for VL models)
+            if self.processor:
+                inputs = self.processor(
+                    images=images or [],
+                    conversations=conversations,
+                    padding=True,
+                    return_tensors="pt"
+                )
+                logger.debug("Using processor with conversations format")
+                return inputs
+            
+            # Fallback to tokenizer chat template
+            elif self.tokenizer and self.has_chat_template():
+                formatted_text = self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False
+                )
+                inputs = self.tokenizer(
+                    formatted_text,
+                    return_tensors="pt",
+                    padding=True
+                )
+                logger.debug("Using tokenizer chat template")
+                return inputs
+                
+            else:
+                # Final fallback
+                formatted_text = self._fallback_chat_format(messages, True)
+                inputs = self.tokenizer(
+                    formatted_text,
+                    return_tensors="pt",
+                    padding=True
+                )
+                logger.debug("Using fallback chat format")
+                return inputs
+                
+        except Exception as e:
+            logger.error(f"Failed to prepare inputs: {e}")
+            raise ModelError(f"Input preparation failed: {str(e)}")
+    
+    def _convert_to_ax_format(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert OpenAI format messages to A.X-4.0-VL-Light format.
+        
+        Args:
+            messages: OpenAI format messages
+            
+        Returns:
+            A.X-4.0-VL-Light format messages
+        """
+        ax_messages = []
+        
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            
+            if isinstance(content, str):
+                # Simple text message
+                ax_messages.append({
+                    "role": role,
+                    "content": [{"type": "text", "text": content}]
+                })
+            elif isinstance(content, list):
+                # Multi-modal content (already in correct format)
+                ax_messages.append({
+                    "role": role,
+                    "content": content
+                })
+        
+        return ax_messages
+    
+    def _fallback_chat_format(
+        self, 
+        messages: List[Dict[str, str]], 
+        add_generation_prompt: bool = True
+    ) -> str:
+        """Fallback chat formatting for models without chat template."""
+        formatted_messages = []
+        
+        for message in messages:
+            role = message.get("role", "")
+            content = message.get("content", "")
+            
+            if role == "system":
+                formatted_messages.append(f"<|system|>\n{content}")
+            elif role == "user":
+                formatted_messages.append(f"<|user|>\n{content}")
+            elif role == "assistant":
+                formatted_messages.append(f"<|assistant|>\n{content}")
+        
+        result = "\n".join(formatted_messages)
+        
+        if add_generation_prompt:
+            result += "\n<|assistant|>\n"
+        
+        return result
 
 
 # Global model manager instance

@@ -259,6 +259,7 @@ class GenerationParameters:
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
+        do_sample: bool = True,
         stop_sequences: Optional[List[str]] = None
     ):
         """Initialize generation parameters.
@@ -280,6 +281,7 @@ class GenerationParameters:
         self.repetition_penalty = max(0.1, repetition_penalty)
         self.presence_penalty = max(-2.0, min(2.0, presence_penalty))
         self.frequency_penalty = max(-2.0, min(2.0, frequency_penalty))
+        self.do_sample = do_sample
         self.stop_sequences = stop_sequences or []
     
     def _validate_temperature(self, temperature: float) -> float:
@@ -317,7 +319,7 @@ class GenerationParameters:
             top_p=self.top_p,
             top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
-            do_sample=self.temperature > 0.0,
+            do_sample=self.do_sample,
             pad_token_id=None,  # Will be set by the model
             eos_token_id=None,  # Will be set by the model
         )
@@ -353,7 +355,7 @@ class ResponseGenerator:
             image_handler: ImageHandler for image processing
         """
         self.model_manager = model_manager
-        self.message_processor = message_processor or MessageProcessor()
+        self.message_processor = message_processor or MessageProcessor(model_manager)
         self.image_handler = image_handler or ImageHandler()
         self.token_counter = TokenCounter()
         
@@ -401,50 +403,84 @@ class ResponseGenerator:
             # Ensure model is ready
             self.model_manager.ensure_loaded()
             
-            # Process messages
+            # Process messages using new official format
             processed_input = self.message_processor.process_messages(
                 request.messages,
                 include_history=True
             )
             
-            # Process images if present
-            image_tensors = []
-            if processed_input.get("has_images", False):
-                image_tensors = await self._process_images(
-                    processed_input.get("images", [])
-                )
+            # Get model inputs (ready for generation)
+            model_inputs = self.message_processor.format_for_generation(processed_input)
             
-            # Create generation parameters
-            gen_params = GenerationParameters(
-                temperature=request.temperature or 0.7,
-                max_tokens=request.max_tokens,
-                top_p=request.top_p or 1.0,
-                stop_sequences=self._normalize_stop_sequences(request.stop)
-            )
+            # Create generation parameters using official recommendations
+            gen_params = self._create_official_generation_params(request)
             
             # Count prompt tokens
-            prompt_text = self.message_processor.format_for_generation(processed_input)
-            prompt_tokens = self.token_counter.count_tokens(prompt_text)
-            
-            # Add image tokens
-            if image_tensors:
-                image_tokens = self.token_counter.count_image_tokens(
-                    processed_input.get("images", [])
-                )
-                prompt_tokens += image_tokens
+            prompt_tokens = self._count_input_tokens(model_inputs, processed_input)
             
             if stream:
                 return self._generate_streaming_response(
-                    prompt_text, gen_params, prompt_tokens, image_tensors
+                    model_inputs, gen_params, prompt_tokens, processed_input
                 )
             else:
                 return await self._generate_complete_response(
-                    prompt_text, gen_params, prompt_tokens, image_tensors
+                    model_inputs, gen_params, prompt_tokens, processed_input
                 )
                 
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             raise ModelError(f"Failed to generate response: {str(e)}")
+    
+    def _create_official_generation_params(self, request: ChatCompletionRequest) -> GenerationParameters:
+        """Create generation parameters using official A.X-4.0-VL-Light recommendations.
+        
+        Args:
+            request: Chat completion request
+            
+        Returns:
+            GenerationParameters with official settings
+        """
+        # Official recommended parameters from Hugging Face documentation
+        return GenerationParameters(
+            temperature=request.temperature if request.temperature is not None else 0.5,  # Official: 0.5
+            max_tokens=request.max_tokens or 256,  # Official: 256 for basic responses
+            top_p=request.top_p if request.top_p is not None else 0.8,  # Official: 0.8
+            top_k=20,  # Official: 20
+            repetition_penalty=1.05,  # Official: 1.05
+            do_sample=True,  # Official: True
+            stop_sequences=self._normalize_stop_sequences(request.stop)
+        )
+    
+    def _count_input_tokens(self, model_inputs: Dict[str, Any], processed_input: Dict[str, Any]) -> int:
+        """Count tokens in model inputs.
+        
+        Args:
+            model_inputs: Prepared model inputs
+            processed_input: Original processed input
+            
+        Returns:
+            Token count
+        """
+        try:
+            # If we have tensor inputs with input_ids, count those
+            if isinstance(model_inputs, dict) and "input_ids" in model_inputs:
+                return model_inputs["input_ids"].shape[-1]
+            
+            # Fallback: try to get text and count
+            if "formatted_text" in model_inputs:
+                return self.token_counter.count_tokens(model_inputs["formatted_text"])
+            
+            # Another fallback: use original text
+            if "text" in processed_input:
+                return self.token_counter.count_tokens(processed_input["text"])
+            
+            # Default fallback
+            logger.warning("Could not determine token count, using default")
+            return 50
+            
+        except Exception as e:
+            logger.error(f"Token counting failed: {e}")
+            return 50
     
     async def _process_images(self, image_data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
         """Process images for model input.
@@ -493,18 +529,18 @@ class ResponseGenerator:
     
     async def _generate_complete_response(
         self,
-        prompt: str,
+        model_inputs: Dict[str, Any],
         gen_params: GenerationParameters,
         prompt_tokens: int,
-        image_tensors: List[torch.Tensor]
+        processed_input: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Generate complete (non-streaming) response.
+        """Generate complete (non-streaming) response using official A.X-4.0-VL-Light format.
         
         Args:
-            prompt: Formatted prompt text
+            model_inputs: Prepared model inputs from processor
             gen_params: Generation parameters
             prompt_tokens: Number of prompt tokens
-            image_tensors: List of image tensors
+            processed_input: Original processed input for fallback
             
         Returns:
             Complete response dictionary
@@ -513,17 +549,15 @@ class ResponseGenerator:
             start_time = time.time()
             
             try:
-                # Prepare model inputs
-                inputs = self._prepare_model_inputs(prompt, image_tensors)
-                
-                # Generate response
-                generated_text = await self._run_model_generation(
-                    inputs, gen_params
+                # Use official A.X-4.0-VL-Light generation method
+                generated_text = await self._run_official_generation(
+                    model_inputs, gen_params
                 )
                 
-                # Extract assistant response
+                # Extract assistant response with improved logic
+                original_prompt = self._extract_original_prompt(model_inputs, processed_input)
                 response_text = self.message_processor.extract_assistant_response(
-                    generated_text, prompt
+                    generated_text, original_prompt
                 )
                 
                 # Apply stop sequences
@@ -538,7 +572,7 @@ class ResponseGenerator:
                 usage = self.token_counter.create_usage(prompt_tokens, completion_tokens)
                 
                 generation_time = time.time() - start_time
-                logger.info(f"Generated response in {generation_time:.2f}s")
+                logger.info(f"Generated response in {generation_time:.2f}s using official A.X-4.0-VL-Light method")
                 
                 return {
                     "text": response_text,
@@ -552,65 +586,153 @@ class ResponseGenerator:
                 logger.error(f"Model generation failed: {e}")
                 raise ModelError(f"Model generation failed: {str(e)}")
     
-    async def _generate_streaming_response(
+    async def _run_official_generation(
         self,
-        prompt: str,
-        gen_params: GenerationParameters,
-        prompt_tokens: int,
-        image_tensors: List[torch.Tensor]
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Generate streaming response.
+        model_inputs: Dict[str, Any],
+        gen_params: GenerationParameters
+    ) -> str:
+        """Run model generation using official A.X-4.0-VL-Light method.
         
         Args:
-            prompt: Formatted prompt text
+            model_inputs: Prepared model inputs from processor
+            gen_params: Generation parameters
+            
+        Returns:
+            Generated text
+        """
+        model = self.model_manager.model
+        processor = self.model_manager.processor
+        tokenizer = self.model_manager.tokenizer
+        
+        # Move inputs to device
+        device = next(model.parameters()).device
+        for key, value in model_inputs.items():
+            if hasattr(value, 'to'):
+                model_inputs[key] = value.to(device)
+        
+        # Create generation config using official parameters
+        generation_config = gen_params.to_generation_config()
+        generation_config.pad_token_id = tokenizer.pad_token_id
+        generation_config.eos_token_id = tokenizer.eos_token_id
+        
+        # Run generation in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        def _generate():
+            with torch.no_grad():
+                outputs = model.generate(
+                    **model_inputs,
+                    generation_config=generation_config,
+                    return_dict_in_generate=True,
+                    output_scores=False
+                )
+                return outputs.sequences[0]
+        
+        # Run generation
+        output_ids = await loop.run_in_executor(None, _generate)
+        
+        # Decode output using processor if available, otherwise tokenizer
+        if processor:
+            # Extract generated tokens (remove input tokens)
+            input_length = model_inputs.get('input_ids', torch.tensor([])).shape[-1]
+            generated_ids_trimmed = output_ids[input_length:]
+            
+            generated_text = processor.decode(
+                generated_ids_trimmed, 
+                skip_special_tokens=True, 
+                clean_up_tokenization_spaces=False
+            )
+        else:
+            generated_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+        
+        return generated_text
+    
+    def _extract_original_prompt(
+        self,
+        model_inputs: Dict[str, Any],
+        processed_input: Dict[str, Any]
+    ) -> str:
+        """Extract original prompt for response extraction.
+        
+        Args:
+            model_inputs: Prepared model inputs
+            processed_input: Original processed input
+            
+        Returns:
+            Original prompt text
+        """
+        # Try to get from tokenizer decoding
+        if "input_ids" in model_inputs:
+            try:
+                return self.model_manager.tokenizer.decode(
+                    model_inputs["input_ids"][0], 
+                    skip_special_tokens=True
+                )
+            except Exception:
+                pass
+        
+        # Fallback to processed input
+        if "text" in processed_input:
+            return processed_input["text"]
+        
+        # Last resort
+        return ""
+    
+    async def _generate_streaming_response(
+        self,
+        model_inputs: Dict[str, Any],
+        gen_params: GenerationParameters,
+        prompt_tokens: int,
+        processed_input: Dict[str, Any]
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Generate streaming response using official A.X-4.0-VL-Light format.
+        
+        Args:
+            model_inputs: Prepared model inputs from processor
             gen_params: Generation parameters
             prompt_tokens: Number of prompt tokens
-            image_tensors: List of image tensors
+            processed_input: Original processed input for fallback
             
         Yields:
             Response chunks
         """
-        async with self._generation_lock:
-            start_time = time.time()
-            completion_tokens = 0
-            generated_text = ""
+        # For now, fallback to complete generation and stream it word by word
+        try:
+            complete_response = await self._generate_complete_response(
+                model_inputs, gen_params, prompt_tokens, processed_input
+            )
             
-            try:
-                # Prepare model inputs
-                inputs = self._prepare_model_inputs(prompt, image_tensors)
-                
-                # Generate streaming response
-                async for chunk in self._run_streaming_generation(inputs, gen_params):
-                    chunk_text = chunk.get("text", "")
-                    if chunk_text:
-                        generated_text += chunk_text
-                        completion_tokens += 1  # Approximate
-                        
-                        yield {
-                            "text": chunk_text,
-                            "finish_reason": None,
-                            "model_name": self.model_manager.model_name
-                        }
-                
-                # Final chunk with usage
-                usage = self.token_counter.create_usage(prompt_tokens, completion_tokens)
-                generation_time = time.time() - start_time
+            response_text = complete_response["text"]
+            words = response_text.split()
+            
+            for i, word in enumerate(words):
+                # Add space before word (except first)
+                chunk_text = f" {word}" if i > 0 else word
                 
                 yield {
-                    "text": "",
-                    "finish_reason": "stop",
-                    "usage": usage,
-                    "generation_time": generation_time,
+                    "text": chunk_text,
+                    "finish_reason": None,
                     "model_name": self.model_manager.model_name
                 }
                 
-            except Exception as e:
-                logger.error(f"Streaming generation failed: {e}")
-                yield {
-                    "error": str(e),
-                    "finish_reason": "error",
-                    "model_name": self.model_manager.model_name
-                }
+                # Small delay to simulate streaming
+                await asyncio.sleep(0.05)
+            
+            # Final chunk with usage info
+            yield {
+                "text": "",
+                "finish_reason": "stop",
+                "usage": complete_response["usage"],
+                "model_name": self.model_manager.model_name
+            }
+                
+        except Exception as e:
+            logger.error(f"Streaming generation failed: {e}")
+            yield {
+                "error": str(e),
+                "finish_reason": "error",
+                "model_name": self.model_manager.model_name
+            }
     
     def _prepare_model_inputs(
         self, 

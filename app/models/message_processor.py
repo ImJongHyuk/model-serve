@@ -1,9 +1,12 @@
 """Message processing utilities for converting OpenAI messages to model input format."""
 
 import logging
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import List, Dict, Any, Optional, Tuple, Union, TYPE_CHECKING
 from app.schemas.chat_models import Message, ContentPart
 from app.schemas.error_models import ValidationError
+
+if TYPE_CHECKING:
+    from app.services.model_manager import ModelManager
 
 
 logger = logging.getLogger(__name__)
@@ -74,21 +77,21 @@ class ConversationContext:
 class MessageProcessor:
     """Processes OpenAI messages and converts them to model input format."""
     
-    def __init__(self, model_name: str = "skt/A.X-4.0-VL-Light"):
+    def __init__(self, model_manager: Optional["ModelManager"] = None):
         """Initialize MessageProcessor.
         
         Args:
-            model_name: Name of the target model for format optimization
+            model_manager: ModelManager instance for chat template support
         """
-        self.model_name = model_name
+        self.model_manager = model_manager
         self.context = ConversationContext()
         
-        # Model-specific formatting templates
+        # Fallback formatting templates (used when no chat template available)
         self.templates = {
-            "system_prefix": "System: ",
-            "user_prefix": "Human: ",
-            "assistant_prefix": "Assistant: ",
-            "conversation_separator": "\n\n",
+            "system_prefix": "<|system|>\n",
+            "user_prefix": "<|user|>\n", 
+            "assistant_prefix": "<|assistant|>\n",
+            "conversation_separator": "\n",
             "turn_separator": "\n",
         }
     
@@ -97,14 +100,14 @@ class MessageProcessor:
         messages: List[Message], 
         include_history: bool = True
     ) -> Dict[str, Any]:
-        """Process OpenAI messages into model input format.
+        """Process OpenAI messages using official A.X-4.0-VL-Light format.
         
         Args:
             messages: List of OpenAI Message objects
             include_history: Whether to include conversation history
             
         Returns:
-            Dictionary containing processed input for the model
+            Dictionary containing processed model inputs and metadata
             
         Raises:
             ValidationError: If message format is invalid
@@ -113,47 +116,111 @@ class MessageProcessor:
             raise ValidationError("Messages list cannot be empty")
         
         try:
-            # Separate messages by role
-            system_messages = []
-            conversation_messages = []
-            
-            for message in messages:
-                if message.role == "system":
-                    system_messages.append(message)
-                else:
-                    conversation_messages.append(message)
-            
-            # Process system messages
-            system_content = self._process_system_messages(system_messages)
-            
-            # Process conversation messages
+            # Convert OpenAI messages to official format
             processed_messages = []
+            images = []
             has_images = False
             
-            for message in conversation_messages:
-                processed_msg = self._process_single_message(message)
-                processed_messages.append(processed_msg)
+            for message in messages:
+                ax_content = []
+                message_images = []
                 
-                if processed_msg.get("has_image", False):
-                    has_images = True
+                if isinstance(message.content, str):
+                    # Simple text message
+                    ax_content.append({"type": "text", "text": message.content})
+                    
+                elif isinstance(message.content, list):
+                    # Multi-modal content
+                    for part in message.content:
+                        if hasattr(part, 'type'):
+                            if part.type == "text":
+                                ax_content.append({"type": "text", "text": part.text or ""})
+                            elif part.type == "image_url":
+                                ax_content.append({"type": "image"})
+                                message_images.append(part.image_url.url)
+                                has_images = True
+                
+                # Add processed message
+                if ax_content:  # Only add if there's content
+                    processed_messages.append({
+                        "role": message.role,
+                        "content": ax_content
+                    })
+                
+                # Store images for processor
+                images.extend(message_images)
             
-            # Build model input
-            model_input = self._build_model_input(
-                system_content=system_content,
-                messages=processed_messages,
-                include_history=include_history,
-                has_images=has_images
-            )
+            # Use ModelManager's prepare_inputs method (official approach)
+            if self.model_manager:
+                try:
+                    model_inputs = self.model_manager.prepare_inputs(
+                        messages=processed_messages,
+                        images=images if has_images else None
+                    )
+                    logger.debug("Using ModelManager prepare_inputs (official method)")
+                    
+                    return {
+                        "model_inputs": model_inputs,
+                        "has_images": has_images,
+                        "images": images,
+                        "message_count": len(processed_messages),
+                        "processed_messages": processed_messages
+                    }
+                    
+                except Exception as e:
+                    logger.warning(f"ModelManager prepare_inputs failed: {e}. Using fallback.")
             
-            # Update conversation context
-            if include_history:
-                self._update_context(system_content, processed_messages)
+            # Fallback: convert to simple format and use fallback formatting
+            simple_messages = []
+            for msg in processed_messages:
+                text_parts = [part["text"] for part in msg["content"] if part.get("type") == "text"]
+                if text_parts:
+                    simple_messages.append({
+                        "role": msg["role"],
+                        "content": " ".join(text_parts)
+                    })
             
-            return model_input
+            formatted_text = self._fallback_format_messages(simple_messages)
+            
+            return {
+                "text": formatted_text,
+                "has_images": has_images,
+                "images": images,
+                "message_count": len(simple_messages),
+                "processed_messages": processed_messages
+            }
             
         except Exception as e:
             logger.error(f"Error processing messages: {e}")
             raise ValidationError(f"Failed to process messages: {str(e)}")
+    
+    def _fallback_format_messages(self, messages: List[Dict[str, str]]) -> str:
+        """Fallback method to format messages when no chat template is available.
+        
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            
+        Returns:
+            Formatted chat string
+        """
+        formatted_parts = []
+        
+        for message in messages:
+            role = message.get("role", "")
+            content = message.get("content", "")
+            
+            if role == "system":
+                formatted_parts.append(f"{self.templates['system_prefix']}{content}")
+            elif role == "user":
+                formatted_parts.append(f"{self.templates['user_prefix']}{content}")
+            elif role == "assistant":
+                formatted_parts.append(f"{self.templates['assistant_prefix']}{content}")
+        
+        # Add final assistant prompt for generation
+        result = self.templates["conversation_separator"].join(formatted_parts)
+        result += f"{self.templates['conversation_separator']}{self.templates['assistant_prefix']}"
+        
+        return result
     
     def _process_system_messages(self, system_messages: List[Message]) -> Optional[str]:
         """Process system messages into a single system prompt.
@@ -333,24 +400,22 @@ class MessageProcessor:
         self, 
         model_input: Dict[str, Any], 
         add_assistant_prefix: bool = True
-    ) -> str:
+    ) -> Dict[str, Any]:
         """Format model input for text generation.
         
         Args:
-            model_input: Processed model input
+            model_input: Processed model input from process_messages
             add_assistant_prefix: Whether to add assistant prefix for generation
             
         Returns:
-            Formatted text for model generation
+            Model inputs ready for generation (either tensor inputs or formatted text)
         """
-        text = model_input["text"]
+        # If we have model_inputs from processor, return them directly
+        if "model_inputs" in model_input:
+            return model_input["model_inputs"]
         
-        if add_assistant_prefix:
-            # Add assistant prefix to prompt generation
-            if not text.endswith(self.templates["assistant_prefix"]):
-                text += f"{self.templates['conversation_separator']}{self.templates['assistant_prefix']}"
-        
-        return text
+        # Fallback: return formatted text
+        return {"formatted_text": model_input.get("text", "")}
     
     def extract_assistant_response(self, generated_text: str, original_prompt: str) -> str:
         """Extract assistant response from generated text.
@@ -362,14 +427,18 @@ class MessageProcessor:
         Returns:
             Extracted assistant response
         """
-        # Remove the original prompt from generated text
-        if generated_text.startswith(original_prompt):
-            response = generated_text[len(original_prompt):].strip()
-        else:
-            response = generated_text.strip()
+        response = generated_text.strip()
+        
+        # Remove the original prompt if it's at the beginning
+        if response.startswith(original_prompt):
+            response = response[len(original_prompt):].strip()
         
         # Clean up response
         response = self._clean_response(response)
+        
+        # If response is empty or seems corrupted, try alternative extraction
+        if not response or len(response.split()) < 2:
+            response = self._alternative_extraction(generated_text, original_prompt)
         
         return response
     
@@ -382,22 +451,73 @@ class MessageProcessor:
         Returns:
             Cleaned response text
         """
-        # Remove common artifacts
+        if not response:
+            return ""
+        
         response = response.strip()
         
-        # Remove assistant prefix if it appears at the start
-        if response.startswith(self.templates["assistant_prefix"]):
-            response = response[len(self.templates["assistant_prefix"]):].strip()
+        # Remove various assistant prefixes
+        prefixes_to_remove = [
+            self.templates["assistant_prefix"],
+            "Assistant:",
+            "Assistant: ",
+            "<|assistant|>",
+            "<|assistant|>\n"
+        ]
         
-        # Remove any trailing conversation markers
-        for prefix in [self.templates["user_prefix"], self.templates["system_prefix"]]:
-            if prefix in response:
-                response = response.split(prefix)[0].strip()
+        for prefix in prefixes_to_remove:
+            if response.startswith(prefix):
+                response = response[len(prefix):].strip()
+                break
+        
+        # Remove trailing conversation markers
+        stop_markers = [
+            self.templates["user_prefix"],
+            self.templates["system_prefix"], 
+            "Human:",
+            "<|user|>",
+            "<|system|>",
+            "\nHuman:",
+            "\n<|user|>",
+            "\n<|system|>"
+        ]
+        
+        for marker in stop_markers:
+            if marker in response:
+                response = response.split(marker)[0].strip()
         
         # Remove excessive whitespace
         response = " ".join(response.split())
         
         return response
+    
+    def _alternative_extraction(self, generated_text: str, original_prompt: str) -> str:
+        """Alternative method to extract response when normal extraction fails.
+        
+        Args:
+            generated_text: Full generated text
+            original_prompt: Original prompt
+            
+        Returns:
+            Extracted response or fallback message
+        """
+        # Try to find the last occurrence of assistant marker
+        assistant_markers = ["Assistant:", "<|assistant|>", "assistant:", "Assistant: "]
+        
+        for marker in assistant_markers:
+            last_idx = generated_text.rfind(marker)
+            if last_idx >= 0:
+                response = generated_text[last_idx + len(marker):].strip()
+                if response and len(response.split()) >= 2:
+                    return self._clean_response(response)
+        
+        # If nothing works, return a clean version of the whole text
+        cleaned = self._clean_response(generated_text)
+        if cleaned:
+            return cleaned
+        
+        # Last resort
+        return "죄송합니다. 응답을 생성하는 중에 문제가 발생했습니다."
     
     def get_conversation_stats(self) -> Dict[str, Any]:
         """Get conversation statistics.
