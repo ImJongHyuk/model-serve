@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "accelerate>=1.9.0",
+    "bitsandbytes>=0.46.1",
     "fastapi>=0.116.1",
     "httpx>=0.28.1",
     "pillow>=11.3.0",
@@ -16,10 +17,9 @@ dependencies = [
     "torch>=2.7.1",
     "torchvision>=0.22.1",
     "transformers>=4.54.1",
+    "triton>=3.3.1",
     "uvicorn[standard]>=0.35.0",
 ]
-
-
 
 [build-system]
 requires = ["hatchling"]

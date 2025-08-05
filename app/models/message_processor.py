@@ -187,7 +187,8 @@ class MessageProcessor:
                 "has_images": has_images,
                 "images": images,
                 "message_count": len(simple_messages),
-                "processed_messages": processed_messages
+                "processed_messages": processed_messages,
+                "formatted_text": formatted_text  # For ResponseGenerator fallback
             }
             
         except Exception as e:

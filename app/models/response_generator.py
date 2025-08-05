@@ -594,15 +594,25 @@ class ResponseGenerator:
         """Run model generation using official A.X-4.0-VL-Light method.
         
         Args:
-            model_inputs: Prepared model inputs from processor
+            model_inputs: Prepared model inputs from processor or fallback text
             gen_params: Generation parameters
             
         Returns:
             Generated text
         """
         model = self.model_manager.model
-        processor = self.model_manager.processor
         tokenizer = self.model_manager.tokenizer
+        
+        # Handle fallback case with formatted_text
+        if "formatted_text" in model_inputs:
+            formatted_text = model_inputs["formatted_text"]
+            # Convert text to proper tensor inputs
+            model_inputs = tokenizer(
+                formatted_text,
+                return_tensors="pt",
+                padding=True
+            )
+            logger.debug("Converted formatted_text to tensor inputs")
         
         # Move inputs to device
         device = next(model.parameters()).device
@@ -631,18 +641,26 @@ class ResponseGenerator:
         # Run generation
         output_ids = await loop.run_in_executor(None, _generate)
         
-        # Decode output using processor if available, otherwise tokenizer
-        if processor:
+        # Decode output - always use tokenizer for safety
+        try:
             # Extract generated tokens (remove input tokens)
-            input_length = model_inputs.get('input_ids', torch.tensor([])).shape[-1]
-            generated_ids_trimmed = output_ids[input_length:]
+            input_ids = model_inputs.get('input_ids')
+            if input_ids is not None and len(input_ids.shape) > 1:
+                input_length = input_ids.shape[-1]
+                generated_ids_trimmed = output_ids[input_length:]
+            else:
+                generated_ids_trimmed = output_ids
             
-            generated_text = processor.decode(
+            # Use tokenizer for decoding
+            generated_text = tokenizer.decode(
                 generated_ids_trimmed, 
                 skip_special_tokens=True, 
                 clean_up_tokenization_spaces=False
             )
-        else:
+            
+        except Exception as e:
+            logger.warning(f"Token extraction failed: {e}. Using full decode.")
+            # Fallback: decode the full output
             generated_text = tokenizer.decode(output_ids, skip_special_tokens=True)
         
         return generated_text
@@ -661,19 +679,42 @@ class ResponseGenerator:
         Returns:
             Original prompt text
         """
+        # Handle fallback case first
+        if "formatted_text" in processed_input:
+            return processed_input["formatted_text"]
+        
         # Try to get from tokenizer decoding
         if "input_ids" in model_inputs:
             try:
+                input_ids = model_inputs["input_ids"]
+                # Handle different tensor shapes safely
+                if hasattr(input_ids, 'shape') and len(input_ids.shape) > 1:
+                    # Batch tensor - take first item
+                    prompt_ids = input_ids[0]
+                else:
+                    # Single tensor
+                    prompt_ids = input_ids
+                
                 return self.model_manager.tokenizer.decode(
-                    model_inputs["input_ids"][0], 
+                    prompt_ids, 
+                    skip_special_tokens=True
+                )
+            except Exception as e:
+                logger.debug(f"Failed to decode input_ids: {e}")
+        
+        # Fallback to processed input text
+        if "text" in processed_input:
+            return processed_input["text"]
+        
+        # Final fallback to model_inputs text
+        if "model_inputs" in processed_input and "input_ids" in processed_input["model_inputs"]:
+            try:
+                return self.model_manager.tokenizer.decode(
+                    processed_input["model_inputs"]["input_ids"][0],
                     skip_special_tokens=True
                 )
             except Exception:
                 pass
-        
-        # Fallback to processed input
-        if "text" in processed_input:
-            return processed_input["text"]
         
         # Last resort
         return ""

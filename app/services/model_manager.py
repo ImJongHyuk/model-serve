@@ -400,12 +400,16 @@ class ModelManager:
         if not self.processor and not self.tokenizer:
             raise ModelNotLoadedError("Processor/Tokenizer not loaded")
         
-        # Convert to official A.X-4.0-VL-Light format
-        conversations = [self._convert_to_ax_format(messages)]
+        # Keep original messages for fallback
+        original_messages = messages.copy()
         
         try:
             # Use processor if available (preferred for VL models)
             if self.processor:
+                # Convert to official A.X-4.0-VL-Light format
+                ax_messages = self._convert_to_ax_format(messages)
+                conversations = [ax_messages]
+                
                 inputs = self.processor(
                     images=images or [],
                     conversations=conversations,
@@ -417,8 +421,9 @@ class ModelManager:
             
             # Fallback to tokenizer chat template
             elif self.tokenizer and self.has_chat_template():
+                # Use original OpenAI format for chat template
                 formatted_text = self.tokenizer.apply_chat_template(
-                    messages,
+                    original_messages,
                     add_generation_prompt=True,
                     tokenize=False
                 )
@@ -431,8 +436,21 @@ class ModelManager:
                 return inputs
                 
             else:
-                # Final fallback
-                formatted_text = self._fallback_chat_format(messages, True)
+                # Final fallback - convert to simple format
+                simple_messages = []
+                for msg in original_messages:
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        # Extract text from multi-modal content
+                        text_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                text_parts.append(part.get("text", ""))
+                        content = " ".join(text_parts)
+                    simple_messages.append({"role": role, "content": content})
+                
+                formatted_text = self._fallback_chat_format(simple_messages, True)
                 inputs = self.tokenizer(
                     formatted_text,
                     return_tensors="pt",
