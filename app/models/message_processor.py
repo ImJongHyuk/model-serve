@@ -132,7 +132,9 @@ class MessageProcessor:
                 elif isinstance(message.content, list):
                     # Multi-modal content
                     for part in message.content:
+                        # Handle both ContentPart objects and dict format
                         if hasattr(part, 'type'):
+                            # ContentPart object
                             if part.type == "text":
                                 ax_content.append({"type": "text", "text": part.text or ""})
                             elif part.type == "image_url":
@@ -141,6 +143,17 @@ class MessageProcessor:
                                 message_images.append(image_url)
                                 has_images = True
                                 logger.info(f"Found image in message. URL length: {len(image_url)}, starts with: {image_url[:50]}...")
+                        elif isinstance(part, dict):
+                            # Dict format from raw JSON
+                            if part.get("type") == "text":
+                                ax_content.append({"type": "text", "text": part.get("text", "")})
+                            elif part.get("type") == "image_url":
+                                ax_content.append({"type": "image"})
+                                image_url = part.get("image_url", {}).get("url", "")
+                                if image_url:
+                                    message_images.append(image_url)
+                                    has_images = True
+                                    logger.info(f"Found image in message. URL length: {len(image_url)}, starts with: {image_url[:50]}...")
                 
                 # Add processed message
                 if ax_content:  # Only add if there's content
@@ -302,8 +315,15 @@ class MessageProcessor:
         elif isinstance(content, list):
             text_parts = []
             for part in content:
-                if part.type == "text" and part.text:
-                    text_parts.append(part.text)
+                # Handle both ContentPart objects and dict format
+                if hasattr(part, 'type') and hasattr(part, 'text'):
+                    # ContentPart object
+                    if part.type == "text" and part.text:
+                        text_parts.append(part.text)
+                elif isinstance(part, dict):
+                    # Dict format from raw JSON
+                    if part.get("type") == "text" and part.get("text"):
+                        text_parts.append(part.get("text"))
             return " ".join(text_parts)
         return ""
     
