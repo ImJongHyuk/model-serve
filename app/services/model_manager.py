@@ -6,6 +6,7 @@ import time
 from typing import Optional, Dict, Any, List
 from enum import Enum
 import torch
+import transformers
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -79,7 +80,8 @@ class ModelManager:
                 logger.warning(f"Failed to enable quantization: {e}. Proceeding without quantization.")
         
         self._lock = asyncio.Lock()
-        
+    
+
     def _determine_device(self) -> str:
         """Determine the best device for model loading."""
         if settings.device != "auto":
@@ -138,6 +140,7 @@ class ModelManager:
                         self.model_name,
                         trust_remote_code=True
                     )
+                    logger.info("Processor loaded successfully")
                 except Exception as e:
                     logger.warning(f"Could not load processor: {e}. Using tokenizer only.")
                     self.processor = None
