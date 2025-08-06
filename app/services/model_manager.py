@@ -478,6 +478,17 @@ class ModelManager:
                 )
                 logger.debug(f"Simple text messages: {simple_messages}")
 
+                # Check if system message is present
+                system_messages = [
+                    msg for msg in simple_messages if msg.get("role") == "system"
+                ]
+                if system_messages:
+                    logger.info(
+                        f"System message found: {system_messages[0].get('content', '')[:100]}..."
+                    )
+                else:
+                    logger.warning("No system message found in conversation")
+
                 # Use extracted images or provided images
                 all_image_urls = extracted_image_urls + (images or [])
 
@@ -567,7 +578,7 @@ class ModelManager:
     def _call_processor_safely(
         self, messages: List[Dict[str, str]], images: List[Any]
     ) -> Dict[str, Any]:
-        """Safely call processor with A.X-4.0-VL-Light specific format.
+        """Call processor with correct A.X-4.0-VL-Light format.
 
         Args:
             messages: Simple text format messages
@@ -576,72 +587,68 @@ class ModelManager:
         Returns:
             Processor inputs
         """
-        # Convert back to A.X-4.0-VL-Light conversation format
-        ax_conversation = []
+        # A.X-4.0-VL-Light expects simple string content, not structured format
+        simple_conversation = []
 
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
 
-            # Create A.X format message
-            ax_msg = {"role": role, "content": [{"type": "text", "text": content}]}
+            # Use simple string content format
+            simple_conversation.append(
+                {
+                    "role": role,
+                    "content": content,  # Just the text string, not a list
+                }
+            )
 
-            # Add image content if this is the message with images
-            if images and role == "user":
-                # Add image placeholder to the content
-                ax_msg["content"].append({"type": "image"})
+        logger.debug("Trying A.X-4.0-VL-Light simple format")
+        logger.debug(f"Conversation: {simple_conversation}")
+        logger.debug(f"Images count: {len(images) if images else 0}")
 
-            ax_conversation.append(ax_msg)
+        # Log each message for debugging
+        for i, msg in enumerate(simple_conversation):
+            logger.debug(
+                f"Message {i}: role={msg.get('role')}, content={msg.get('content', '')[:50]}..."
+            )
 
-        # Try A.X-4.0-VL-Light specific format
         try:
-            logger.debug("Trying A.X-4.0-VL-Light processor format")
-            logger.debug(f"Conversation: {ax_conversation}")
-            logger.debug(f"Images count: {len(images) if images else 0}")
-
             if images:
+                # For multimodal input
                 inputs = self.processor(
                     images=images,
-                    conversations=[ax_conversation],
+                    conversations=[simple_conversation],
                     padding=True,
                     return_tensors="pt",
                 )
             else:
+                # For text-only input
                 inputs = self.processor(
-                    conversations=[ax_conversation],
+                    conversations=[simple_conversation],
                     padding=True,
                     return_tensors="pt",
                 )
-            logger.debug("A.X-4.0-VL-Light processor format succeeded")
+
+            logger.debug("A.X-4.0-VL-Light processor succeeded")
             return inputs
 
-        except Exception as e1:
-            logger.error(f"A.X-4.0-VL-Light processor format failed: {e1}")
+        except Exception as e:
+            logger.error(f"A.X-4.0-VL-Light processor failed: {e}")
 
-            # Fallback: Try with combined text
-            try:
-                logger.debug("Trying fallback with combined text")
-                combined_text = self._combine_messages_to_text(messages)
+            # Final fallback: use tokenizer directly
+            logger.debug("Falling back to tokenizer")
+            combined_text = self._combine_messages_to_text(messages)
 
-                if images:
-                    inputs = self.processor(
-                        text=combined_text,
-                        images=images,
-                        padding=True,
-                        return_tensors="pt",
-                    )
-                else:
-                    inputs = self.processor(
-                        text=combined_text,
-                        padding=True,
-                        return_tensors="pt",
-                    )
-                logger.debug("Fallback processor format succeeded")
-                return inputs
+            if self.tokenizer and self.has_chat_template():
+                formatted_text = self.tokenizer.apply_chat_template(
+                    simple_conversation, add_generation_prompt=True, tokenize=False
+                )
+            else:
+                formatted_text = combined_text
 
-            except Exception as e2:
-                logger.error(f"All processor formats failed. Last error: {e2}")
-                raise ModelError(f"Processor call failed: {e2}")
+            inputs = self.tokenizer(formatted_text, return_tensors="pt", padding=True)
+            logger.debug("Tokenizer fallback succeeded")
+            return inputs
 
     def _combine_messages_to_text(self, messages: List[Dict[str, str]]) -> str:
         """Combine messages into a single text string.
