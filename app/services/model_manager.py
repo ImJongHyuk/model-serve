@@ -553,9 +553,8 @@ class ModelManager:
                                 url = image_url_obj.get("url", "")
                                 if url:
                                     image_urls.append(url)
-                                    text_parts.append(
-                                        "<image>"
-                                    )  # Placeholder for image
+                                    # Don't add image placeholder in text - let processor handle it
+                                    pass
                 text_content = " ".join(text_parts)
             else:
                 text_content = str(content)
@@ -568,7 +567,7 @@ class ModelManager:
     def _call_processor_safely(
         self, messages: List[Dict[str, str]], images: List[Any]
     ) -> Dict[str, Any]:
-        """Safely call processor with multiple format attempts.
+        """Safely call processor with A.X-4.0-VL-Light specific format.
 
         Args:
             messages: Simple text format messages
@@ -577,60 +576,72 @@ class ModelManager:
         Returns:
             Processor inputs
         """
-        # Format 1: Try with conversations parameter
+        # Convert back to A.X-4.0-VL-Light conversation format
+        ax_conversation = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # Create A.X format message
+            ax_msg = {"role": role, "content": [{"type": "text", "text": content}]}
+
+            # Add image content if this is the message with images
+            if images and role == "user":
+                # Add image placeholder to the content
+                ax_msg["content"].append({"type": "image"})
+
+            ax_conversation.append(ax_msg)
+
+        # Try A.X-4.0-VL-Light specific format
         try:
-            logger.debug("Trying processor format 1: conversations parameter")
+            logger.debug("Trying A.X-4.0-VL-Light processor format")
+            logger.debug(f"Conversation: {ax_conversation}")
+            logger.debug(f"Images count: {len(images) if images else 0}")
+
             if images:
                 inputs = self.processor(
                     images=images,
-                    conversations=[messages],
+                    conversations=[ax_conversation],
                     padding=True,
                     return_tensors="pt",
                 )
             else:
                 inputs = self.processor(
-                    conversations=[messages], padding=True, return_tensors="pt"
+                    conversations=[ax_conversation],
+                    padding=True,
+                    return_tensors="pt",
                 )
-            logger.debug("Processor format 1 succeeded")
+            logger.debug("A.X-4.0-VL-Light processor format succeeded")
             return inputs
+
         except Exception as e1:
-            logger.warning(f"Processor format 1 failed: {e1}")
+            logger.error(f"A.X-4.0-VL-Light processor format failed: {e1}")
 
-        # Format 2: Try with text parameter (common for many VL models)
-        try:
-            logger.debug("Trying processor format 2: text parameter")
-            # Combine all messages into a single text
-            combined_text = self._combine_messages_to_text(messages)
+            # Fallback: Try with combined text
+            try:
+                logger.debug("Trying fallback with combined text")
+                combined_text = self._combine_messages_to_text(messages)
 
-            if images:
-                inputs = self.processor(
-                    text=combined_text, images=images, padding=True, return_tensors="pt"
-                )
-            else:
-                inputs = self.processor(
-                    text=combined_text, padding=True, return_tensors="pt"
-                )
-            logger.debug("Processor format 2 succeeded")
-            return inputs
-        except Exception as e2:
-            logger.warning(f"Processor format 2 failed: {e2}")
+                if images:
+                    inputs = self.processor(
+                        text=combined_text,
+                        images=images,
+                        padding=True,
+                        return_tensors="pt",
+                    )
+                else:
+                    inputs = self.processor(
+                        text=combined_text,
+                        padding=True,
+                        return_tensors="pt",
+                    )
+                logger.debug("Fallback processor format succeeded")
+                return inputs
 
-        # Format 3: Try direct text input
-        try:
-            logger.debug("Trying processor format 3: direct text input")
-            combined_text = self._combine_messages_to_text(messages)
-
-            if images:
-                inputs = self.processor(
-                    combined_text, images=images, return_tensors="pt"
-                )
-            else:
-                inputs = self.processor(combined_text, return_tensors="pt")
-            logger.debug("Processor format 3 succeeded")
-            return inputs
-        except Exception as e3:
-            logger.error(f"All processor formats failed. Last error: {e3}")
-            raise ModelError(f"Processor call failed with all formats: {e3}")
+            except Exception as e2:
+                logger.error(f"All processor formats failed. Last error: {e2}")
+                raise ModelError(f"Processor call failed: {e2}")
 
     def _combine_messages_to_text(self, messages: List[Dict[str, str]]) -> str:
         """Combine messages into a single text string.
