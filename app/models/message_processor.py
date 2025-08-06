@@ -155,6 +155,8 @@ class MessageProcessor:
             # Use ModelManager's prepare_inputs method (official approach)
             if self.model_manager:
                 try:
+                    logger.debug(f"Calling prepare_inputs with processed_messages: {processed_messages}")
+                    logger.debug(f"Images to process: {images if has_images else None}")
                     model_inputs = self.model_manager.prepare_inputs(
                         messages=processed_messages,
                         images=images if has_images else None

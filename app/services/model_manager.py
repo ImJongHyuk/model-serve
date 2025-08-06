@@ -406,22 +406,50 @@ class ModelManager:
         try:
             # Use processor if available (preferred for VL models)
             if self.processor:
-                # Convert to official A.X-4.0-VL-Light format
-                ax_messages = self._convert_to_ax_format(messages)
+                logger.debug(f"Preparing inputs with processor. Messages: {len(messages)}")
+                logger.debug(f"First message type: {type(messages[0]) if messages else 'None'}")
+                logger.debug(f"First message content: {messages[0] if messages else 'None'}")
+                
+                # Check if messages are already in A.X-4.0-VL-Light format
+                # (i.e., content is already a list with type/text structure)
+                if (messages and isinstance(messages[0].get('content'), list) and 
+                    messages[0]['content'] and 'type' in messages[0]['content'][0]):
+                    logger.debug("Messages already in A.X-4.0-VL-Light format, using directly")
+                    ax_messages = messages
+                else:
+                    # Convert to official A.X-4.0-VL-Light format
+                    try:
+                        ax_messages = self._convert_to_ax_format(messages)
+                        logger.debug(f"Converted messages: {ax_messages}")
+                    except Exception as e:
+                        logger.error(f"Failed in _convert_to_ax_format: {e}")
+                        raise e
+                    
                 conversations = [ax_messages]
                 
                 # Process images if provided
                 processed_images = []
                 if images:
                     logger.info(f"Processing {len(images)} images for A.X-4.0-VL-Light")
-                    processed_images = self._process_images_for_processor(images)
+                    try:
+                        processed_images = self._process_images_for_processor(images)
+                    except Exception as e:
+                        logger.error(f"Failed in _process_images_for_processor: {e}")
+                        raise e
                 
-                inputs = self.processor(
-                    images=processed_images,
-                    conversations=conversations,
-                    padding=True,
-                    return_tensors="pt"
-                )
+                logger.debug(f"About to call processor with conversations: {conversations}")
+                try:
+                    inputs = self.processor(
+                        images=processed_images,
+                        conversations=conversations,
+                        padding=True,
+                        return_tensors="pt"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed in processor call: {e}")
+                    logger.error(f"Conversations: {conversations}")
+                    logger.error(f"Images count: {len(processed_images)}")
+                    raise e
                 logger.debug(f"Using processor with conversations format. Images: {len(processed_images)}")
                 return inputs
             
@@ -481,20 +509,43 @@ class ModelManager:
         ax_messages = []
         
         for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            
-            if isinstance(content, str):
-                # Simple text message
+            try:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                
+                if isinstance(content, str):
+                    # Simple text message
+                    ax_messages.append({
+                        "role": role,
+                        "content": [{"type": "text", "text": content}]
+                    })
+                elif isinstance(content, list):
+                    # Multi-modal content (already in correct format or needs validation)
+                    # Ensure all items in content list are valid
+                    validated_content = []
+                    for item in content:
+                        if isinstance(item, dict) and "type" in item:
+                            validated_content.append(item)
+                        else:
+                            logger.warning(f"Invalid content item: {item}, skipping")
+                    
+                    ax_messages.append({
+                        "role": role,
+                        "content": validated_content
+                    })
+                else:
+                    logger.warning(f"Unknown content type: {type(content)} for role {role}")
+                    # Default to empty text
+                    ax_messages.append({
+                        "role": role,
+                        "content": [{"type": "text", "text": ""}]
+                    })
+            except Exception as e:
+                logger.error(f"Error processing message {msg}: {e}")
+                # Skip this message or add default
                 ax_messages.append({
-                    "role": role,
-                    "content": [{"type": "text", "text": content}]
-                })
-            elif isinstance(content, list):
-                # Multi-modal content (already in correct format)
-                ax_messages.append({
-                    "role": role,
-                    "content": content
+                    "role": msg.get("role", "user"),
+                    "content": [{"type": "text", "text": ""}]
                 })
         
         return ax_messages
