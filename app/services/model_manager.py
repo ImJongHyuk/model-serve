@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 import torch
 import transformers
@@ -453,7 +453,7 @@ class ModelManager:
     def prepare_inputs(
         self, messages: List[Dict[str, Any]], images: List[Any] = None
     ) -> Dict[str, Any]:
-        """Prepare model inputs using processor's conversations format (official method).
+        """Prepare model inputs with simplified approach for skt/A.X-4.0-VL-Light.
 
         Args:
             messages: List of message dictionaries in OpenAI format
@@ -465,80 +465,39 @@ class ModelManager:
         if not self.processor and not self.tokenizer:
             raise ModelNotLoadedError("Processor/Tokenizer not loaded")
 
-        # Keep original messages for fallback
-        original_messages = messages.copy()
-
         try:
             # Use processor if available (preferred for VL models)
             if self.processor:
                 logger.debug(
                     f"Preparing inputs with processor. Messages: {len(messages)}"
                 )
-                logger.debug(
-                    f"First message type: {type(messages[0]) if messages else 'None'}"
+
+                # Convert messages to simple text format and extract image URLs
+                simple_messages, extracted_image_urls = (
+                    self._convert_to_simple_text_format(messages)
                 )
-                logger.debug(
-                    f"First message content: {messages[0] if messages else 'None'}"
-                )
+                logger.debug(f"Simple text messages: {simple_messages}")
 
-                # Check if messages are already in A.X-4.0-VL-Light format
-                # (i.e., content is already a list with type/text structure)
-                if (
-                    messages
-                    and isinstance(messages[0].get("content"), list)
-                    and messages[0]["content"]
-                    and "type" in messages[0]["content"][0]
-                ):
-                    logger.debug(
-                        "Messages already in A.X-4.0-VL-Light format, using directly"
-                    )
-                    ax_messages = messages
-                else:
-                    # Convert to official A.X-4.0-VL-Light format
-                    try:
-                        ax_messages = self._convert_to_ax_format(messages)
-                        logger.debug(f"Converted messages: {ax_messages}")
-                    except Exception as e:
-                        logger.error(f"Failed in _convert_to_ax_format: {e}")
-                        raise e
+                # Use extracted images or provided images
+                all_image_urls = extracted_image_urls + (images or [])
 
-                conversations = [ax_messages]
-
-                # Process images if provided
+                # Process images if any are found
                 processed_images = []
-                if images:
-                    logger.info(f"Processing {len(images)} images for A.X-4.0-VL-Light")
-                    try:
-                        processed_images = self._process_images_for_processor(images)
-                    except Exception as e:
-                        logger.error(f"Failed in _process_images_for_processor: {e}")
-                        raise e
-
-                logger.debug(
-                    f"About to call processor with conversations: {conversations}"
-                )
-                try:
-                    inputs = self.processor(
-                        images=processed_images,
-                        conversations=conversations,
-                        padding=True,
-                        return_tensors="pt",
+                if all_image_urls:
+                    logger.info(f"Processing {len(all_image_urls)} images")
+                    processed_images = self._process_images_for_processor(
+                        all_image_urls
                     )
-                except Exception as e:
-                    logger.error(f"Failed in processor call: {e}")
-                    logger.error(f"Conversations: {conversations}")
-                    logger.error(f"Images count: {len(processed_images)}")
-                    raise e
-                logger.debug(
-                    f"Using processor with conversations format. Images: {len(processed_images)}"
-                )
-                return inputs
 
-            # Fallback to tokenizer chat template
+                # Try processor with simple text format
+                return self._call_processor_safely(simple_messages, processed_images)
+
+            # Fallback to tokenizer
             elif self.tokenizer and self.has_chat_template():
-                # Use original OpenAI format for chat template
+                # Convert to simple format for tokenizer
+                simple_messages, _ = self._convert_to_simple_text_format(messages)
                 formatted_text = self.tokenizer.apply_chat_template(
-                    original_messages, add_generation_prompt=True, tokenize=False
+                    simple_messages, add_generation_prompt=True, tokenize=False
                 )
                 inputs = self.tokenizer(
                     formatted_text, return_tensors="pt", padding=True
@@ -547,20 +506,8 @@ class ModelManager:
                 return inputs
 
             else:
-                # Final fallback - convert to simple format
-                simple_messages = []
-                for msg in original_messages:
-                    role = msg.get("role", "")
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        # Extract text from multi-modal content
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                text_parts.append(part.get("text", ""))
-                        content = " ".join(text_parts)
-                    simple_messages.append({"role": role, "content": content})
-
+                # Final fallback
+                simple_messages, _ = self._convert_to_simple_text_format(messages)
                 formatted_text = self._fallback_chat_format(simple_messages, True)
                 inputs = self.tokenizer(
                     formatted_text, return_tensors="pt", padding=True
@@ -572,59 +519,144 @@ class ModelManager:
             logger.error(f"Failed to prepare inputs: {e}")
             raise ModelError(f"Input preparation failed: {str(e)}")
 
-    def _convert_to_ax_format(
+    def _convert_to_simple_text_format(
         self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Convert OpenAI format messages to A.X-4.0-VL-Light format.
+    ) -> Tuple[List[Dict[str, str]], List[str]]:
+        """Convert OpenAI messages to simple text format and extract image URLs.
 
         Args:
             messages: OpenAI format messages
 
         Returns:
-            A.X-4.0-VL-Light format messages
+            Tuple of (simple text format messages, image URLs)
         """
-        ax_messages = []
+        simple_messages = []
+        image_urls = []
 
         for msg in messages:
-            try:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
+            role = msg.get("role", "")
+            content = msg.get("content", "")
 
-                if isinstance(content, str):
-                    # Simple text message
-                    ax_messages.append(
-                        {"role": role, "content": [{"type": "text", "text": content}]}
-                    )
-                elif isinstance(content, list):
-                    # Multi-modal content (already in correct format or needs validation)
-                    # Ensure all items in content list are valid
-                    validated_content = []
-                    for item in content:
-                        if isinstance(item, dict) and "type" in item:
-                            validated_content.append(item)
-                        else:
-                            logger.warning(f"Invalid content item: {item}, skipping")
+            # Extract text content and image URLs
+            if isinstance(content, str):
+                text_content = content
+            elif isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif part.get("type") == "image_url":
+                            # Extract image URL
+                            image_url_obj = part.get("image_url", {})
+                            if isinstance(image_url_obj, dict):
+                                url = image_url_obj.get("url", "")
+                                if url:
+                                    image_urls.append(url)
+                                    text_parts.append(
+                                        "<image>"
+                                    )  # Placeholder for image
+                text_content = " ".join(text_parts)
+            else:
+                text_content = str(content)
 
-                    ax_messages.append({"role": role, "content": validated_content})
-                else:
-                    logger.warning(
-                        f"Unknown content type: {type(content)} for role {role}"
-                    )
-                    # Default to empty text
-                    ax_messages.append(
-                        {"role": role, "content": [{"type": "text", "text": ""}]}
-                    )
-            except Exception as e:
-                logger.error(f"Error processing message {msg}: {e}")
-                # Skip this message or add default
-                ax_messages.append(
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": [{"type": "text", "text": ""}],
-                    }
+            if text_content.strip():  # Only add non-empty messages
+                simple_messages.append({"role": role, "content": text_content.strip()})
+
+        return simple_messages, image_urls
+
+    def _call_processor_safely(
+        self, messages: List[Dict[str, str]], images: List[Any]
+    ) -> Dict[str, Any]:
+        """Safely call processor with multiple format attempts.
+
+        Args:
+            messages: Simple text format messages
+            images: Processed images
+
+        Returns:
+            Processor inputs
+        """
+        # Format 1: Try with conversations parameter
+        try:
+            logger.debug("Trying processor format 1: conversations parameter")
+            if images:
+                inputs = self.processor(
+                    images=images,
+                    conversations=[messages],
+                    padding=True,
+                    return_tensors="pt",
                 )
+            else:
+                inputs = self.processor(
+                    conversations=[messages], padding=True, return_tensors="pt"
+                )
+            logger.debug("Processor format 1 succeeded")
+            return inputs
+        except Exception as e1:
+            logger.warning(f"Processor format 1 failed: {e1}")
 
-        return ax_messages
+        # Format 2: Try with text parameter (common for many VL models)
+        try:
+            logger.debug("Trying processor format 2: text parameter")
+            # Combine all messages into a single text
+            combined_text = self._combine_messages_to_text(messages)
+
+            if images:
+                inputs = self.processor(
+                    text=combined_text, images=images, padding=True, return_tensors="pt"
+                )
+            else:
+                inputs = self.processor(
+                    text=combined_text, padding=True, return_tensors="pt"
+                )
+            logger.debug("Processor format 2 succeeded")
+            return inputs
+        except Exception as e2:
+            logger.warning(f"Processor format 2 failed: {e2}")
+
+        # Format 3: Try direct text input
+        try:
+            logger.debug("Trying processor format 3: direct text input")
+            combined_text = self._combine_messages_to_text(messages)
+
+            if images:
+                inputs = self.processor(
+                    combined_text, images=images, return_tensors="pt"
+                )
+            else:
+                inputs = self.processor(combined_text, return_tensors="pt")
+            logger.debug("Processor format 3 succeeded")
+            return inputs
+        except Exception as e3:
+            logger.error(f"All processor formats failed. Last error: {e3}")
+            raise ModelError(f"Processor call failed with all formats: {e3}")
+
+    def _combine_messages_to_text(self, messages: List[Dict[str, str]]) -> str:
+        """Combine messages into a single text string.
+
+        Args:
+            messages: Simple text format messages
+
+        Returns:
+            Combined text string
+        """
+        text_parts = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "system":
+                text_parts.append(f"System: {content}")
+            elif role == "user":
+                text_parts.append(f"User: {content}")
+            elif role == "assistant":
+                text_parts.append(f"Assistant: {content}")
+            else:
+                text_parts.append(content)
+
+        return "\n".join(text_parts)
 
     def _fallback_chat_format(
         self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
