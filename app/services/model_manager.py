@@ -410,13 +410,19 @@ class ModelManager:
                 ax_messages = self._convert_to_ax_format(messages)
                 conversations = [ax_messages]
                 
+                # Process images if provided
+                processed_images = []
+                if images:
+                    logger.info(f"Processing {len(images)} images for A.X-4.0-VL-Light")
+                    processed_images = self._process_images_for_processor(images)
+                
                 inputs = self.processor(
-                    images=images or [],
+                    images=processed_images,
                     conversations=conversations,
                     padding=True,
                     return_tensors="pt"
                 )
-                logger.debug("Using processor with conversations format")
+                logger.debug(f"Using processor with conversations format. Images: {len(processed_images)}")
                 return inputs
             
             # Fallback to tokenizer chat template
@@ -518,6 +524,68 @@ class ModelManager:
             result += "\n<|assistant|>\n"
         
         return result
+    
+    def _process_images_for_processor(self, image_urls: List[str]) -> List[Any]:
+        """Process image URLs to format suitable for A.X-4.0-VL-Light processor.
+        
+        Args:
+            image_urls: List of image URLs (base64 data URLs or HTTP URLs)
+            
+        Returns:
+            List of processed images (PIL Images)
+        """
+        import base64
+        import io
+        from PIL import Image
+        import requests
+        
+        processed_images = []
+        
+        for url in image_urls:
+            try:
+                if url.startswith('data:image/'):
+                    # Handle base64 data URL
+                    logger.debug(f"Processing base64 image URL: {url[:100]}...")
+                    
+                    # Extract base64 data
+                    header, encoded = url.split(',', 1)
+                    image_data = base64.b64decode(encoded)
+                    
+                    # Create PIL Image
+                    image = Image.open(io.BytesIO(image_data))
+                    
+                    # Convert to RGB if necessary
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                    
+                    processed_images.append(image)
+                    logger.info(f"Successfully processed base64 image: {image.size}")
+                    
+                elif url.startswith('http'):
+                    # Handle HTTP URL
+                    logger.debug(f"Processing HTTP image URL: {url}")
+                    
+                    response = requests.get(url, timeout=10)
+                    response.raise_for_status()
+                    
+                    image = Image.open(io.BytesIO(response.content))
+                    
+                    # Convert to RGB if necessary  
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                    
+                    processed_images.append(image)
+                    logger.info(f"Successfully processed HTTP image: {image.size}")
+                    
+                else:
+                    logger.warning(f"Unsupported image URL format: {url[:100]}...")
+                    
+            except Exception as e:
+                logger.error(f"Failed to process image URL {url[:100]}...: {e}")
+                continue
+        
+        logger.info(f"Processed {len(processed_images)} images successfully")
+        return processed_images
 
 
 # Global model manager instance

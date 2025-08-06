@@ -1,0 +1,21 @@
+{
+  "model": "/root/ax4-vl-light",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "이 이미지에 포함된 모든 텍스트를 정확히 읽어서 알려주세요."
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    }
+  ],
+  "max_tokens": 300
+}

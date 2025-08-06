@@ -137,8 +137,10 @@ class MessageProcessor:
                                 ax_content.append({"type": "text", "text": part.text or ""})
                             elif part.type == "image_url":
                                 ax_content.append({"type": "image"})
-                                message_images.append(part.image_url.url)
+                                image_url = part.image_url.url
+                                message_images.append(image_url)
                                 has_images = True
+                                logger.info(f"Found image in message. URL length: {len(image_url)}, starts with: {image_url[:50]}...")
                 
                 # Add processed message
                 if ax_content:  # Only add if there's content
